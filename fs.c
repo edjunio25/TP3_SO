@@ -9,6 +9,14 @@
 #include <sys/types.h>
 #include <stddef.h>
 
+//MODIFIQUE OS NOMES DAS CONSTANTES!!!
+
+#define MAX_NAME 100 // Max files' name
+#define MAX_SUBFOLDERS 100 // Max number of subfolders in a path
+#define MAX_FILE_SIZE 5000 // Max file size (in blocks)
+#define MAX_PATH_NAME 4000// Max length of a path's name
+#define EPS 1e-6 // Epsilon to compare float numbers
+
 //Buscar o tamanho do arquivo fname
 int fileSize(const char *filename){
     FILE *file = fopen(filename, "r");
@@ -255,14 +263,414 @@ int fs_unlink(struct superblock *sb, const char *fname){
 
 }
 
-int fs_mkdir(struct superblock *sb, const char *dname){
+int fs_mkdir(struct superblock *sb, const char *directory_name) {
+    int index, subfolder_index, inode_index, found;
+    int path_elements_count;
+    uint64_t block_numbers[MAX_FILE_SIZE];
+    uint64_t info_block_number, inode_block_number;
+    char subfolders[MAX_SUBFOLDERS][MAX_NAME];
+    char *token;
+    char *path;
+    struct inode *current_inode, *child_inode;
+    struct nodeinfo *current_node_info, *child_node_info;
+
+    current_inode = (struct inode*) malloc(sb->blksz);
+    child_inode = (struct inode*) malloc(sb->blksz);
+    current_node_info = (struct nodeinfo*) malloc(sb->blksz);
+    child_node_info = (struct nodeinfo*) malloc(sb->blksz);
+
+    path = (char*) malloc(MAX_PATH_NAME*sizeof(char));
+    strcpy(path, directory_name);
+
+    // Separar as subpastas em um vetor de strings
+    index = 0;
+    token = strtok(path, "/"); // Diretório raiz
+    while(token != NULL){
+        strcpy(subfolders[index], token);
+        token = strtok(NULL, "/");
+        index++;
+    }
+    path_elements_count = index;
+
+    // Informações do nodeinfo do diretório raiz
+    lseek(sb->fd, sb->blksz, SEEK_SET);
+    read(sb->fd, current_node_info, sb->blksz);
     
+    // iNode do diretório raiz
+    lseek(sb->fd, sb->root*sb->blksz, SEEK_SET);
+    read(sb->fd, current_inode, sb->blksz);
+
+    block_numbers[0] = 1;
+    block_numbers[1] = 2;
+
+    // Percorrer cada subpasta no caminho, até encontrar o diretório, se existir
+    for(subfolder_index = 0; subfolder_index < path_elements_count-1; subfolder_index++){
+        // Verificar cada elemento dentro do diretório atual
+        while(1){
+            found = 0;
+            // Verificar se o elemento está no iNode atual
+            for(inode_index = 0; inode_index < current_node_info->size; inode_index++){
+                // iNode de um arquivo
+                lseek(sb->fd, current_inode->links[inode_index]*sb->blksz, SEEK_SET);
+                read(sb->fd, child_inode, sb->blksz);
+            
+                // Verificar se estamos em um iNode filho
+                if(child_inode->mode == IMCHILD){
+                    // Saltar para o primeiro iNode
+                    lseek(sb->fd, child_inode->parent*sb->blksz, SEEK_SET);
+                    read(sb->fd, child_inode, sb->blksz);
+                }
+                
+                // Obter as informações do nodeinfo do arquivo
+                lseek(sb->fd, child_inode->meta*sb->blksz, SEEK_SET);
+                read(sb->fd, child_node_info, sb->blksz);
+
+                if(strcmp(child_node_info->name, subfolders[subfolder_index]) == 0){
+                    found = 1;
+                    break;
+                }
+            }
+
+            if(found){
+                // A subpasta ou arquivo foi encontrada no iNode atual
+                if(subfolder_index == (path_elements_count-2)){
+                    block_numbers[0] = child_inode->meta;
+                    block_numbers[1] = current_inode->links[inode_index];
+                }
+                break;
+            }else if(subfolder_index == (path_elements_count-2) || current_inode->next == 0){
+                // O diretório não foi encontrado
+                errno = ENOENT;
+                return -1;
+            }
+
+            // Saltar para o próximo iNode
+            lseek(sb->fd, current_inode->next*sb->blksz, SEEK_SET);
+            read(sb->fd, current_inode, sb->blksz);
+        }
+
+        // Saltar para o próximo diretório
+        copy_inode(current_inode, child_inode, child_node_info);
+        copy_nodeinfo(current_node_info, child_node_info);
+    }
+
+    // Novo nodeinfo
+    info_block_number = fs_get_block(sb);
+    child_node_info->size = 0; // O diretório começa vazio
+    strcpy(child_node_info->name, subfolders[path_elements_count-1]);
+
+    // Escrever o nodeinfo
+    lseek(sb->fd, info_block_number*sb->blksz, SEEK_SET);
+    write(sb->fd, child_node_info, sb->blksz);
+    
+    // Novo iNode
+    inode_block_number = fs_get_block(sb);
+    child_inode->mode = IMDIR;
+    child_inode->parent = inode_block_number;
+    child_inode->meta = info_block_number;
+    child_inode->next = 0;
+
+    // Escrever o iNode
+    lseek(sb->fd, inode_block_number*sb->blksz, SEEK_SET);
+    write(sb->fd, child_inode, sb->blksz);
+
+    // Atualizar as informações do diretório pai
+    current_inode->links[current_node_info->size] = inode_block_number;
+    current_node_info->size++;
+
+    // Escrever as informações atualizadas do nodeinfo do diretório pai
+    lseek(sb->fd, block_numbers[0]*sb->blksz, SEEK_SET);
+    write(sb->fd, current_node_info, sb->blksz);    
+
+    // Escrever o primeiro iNode atualizado do diretório pai
+    lseek(sb->fd, block_numbers[1]*sb->blksz, SEEK_SET);
+    write(sb->fd, current_inode, sb->blksz);    
+
+    // Escrever o superblock atualizado
+    lseek(sb->fd, 0, SEEK_SET);
+    write(sb->fd, sb, sb->blksz);    
+
+    free(current_inode);
+    free(child_inode);
+    free(current_node_info);
+    free(child_node_info);
+
+    return 0;
 }
 
-int fs_rmdir(struct superblock *sb, const char *dname){
-    
+int fs_rmdir(struct superblock *sb, const char *directory_name) {
+    int index, subfolder_index, inode_index, found;
+    int path_elements_count;
+    uint64_t block_numbers[MAX_FILE_SIZE], parent_info_block_number, parent_inode_block_number;
+    char subfolders[MAX_SUBFOLDERS][MAX_NAME];
+    char *token;
+    char *path;
+
+    struct inode *current_inode, *child_inode, *parent_inode;
+    struct nodeinfo *current_node_info, *child_node_info, *parent_node_info;
+
+    current_inode = (struct inode*) malloc(sb->blksz);
+    child_inode = (struct inode*) malloc(sb->blksz);
+    parent_inode = (struct inode*) malloc(sb->blksz);
+    current_node_info = (struct nodeinfo*) malloc(sb->blksz);
+    child_node_info = (struct nodeinfo*) malloc(sb->blksz);
+    parent_node_info = (struct nodeinfo*) malloc(sb->blksz);
+
+    path = (char*) malloc(MAX_PATH_NAME*sizeof(char));
+    strcpy(path, directory_name);
+
+    // Separar as subpastas em um vetor de strings
+    index = 0;
+    token = strtok(path, "/"); // Diretório raiz
+    while(token != NULL){
+        strcpy(subfolders[index], token);
+        token = strtok(NULL, "/");
+        index++;
+    }
+    path_elements_count = index;
+
+    // iNode do diretório raiz
+    lseek(sb->fd, sb->root*sb->blksz, SEEK_SET);
+    read(sb->fd, current_inode, sb->blksz);
+
+    // Nodeinfo do diretório raiz
+    lseek(sb->fd, sb->blksz, SEEK_SET);
+    read(sb->fd, current_node_info, sb->blksz);
+
+    block_numbers[0] = 1;
+    block_numbers[1] = 2;
+
+    parent_info_block_number = 1; // Nodeinfo do diretório raiz
+    parent_inode_block_number = 2; // iNode do diretório raiz
+
+    // Percorrer cada subpasta no caminho
+    for(subfolder_index = 0; subfolder_index < path_elements_count; subfolder_index++){
+        // Verificar cada elemento dentro do diretório atual
+        while(1){
+            found = 0;
+            // Verificar se o elemento está no iNode atual
+            for(inode_index = 0; inode_index < current_node_info->size; inode_index++){
+                // iNode de um arquivo
+                lseek(sb->fd, current_inode->links[inode_index]*sb->blksz, SEEK_SET);
+                read(sb->fd, child_inode, sb->blksz);
+            
+                // Verificar se estamos em um iNode filho
+                if(child_inode->mode == IMCHILD){
+                    // Saltar para o primeiro iNode
+                    lseek(sb->fd, child_inode->parent*sb->blksz, SEEK_SET);
+                    read(sb->fd, child_inode, sb->blksz);
+                }
+                
+                // Obter as informações do nodeinfo do arquivo
+                lseek(sb->fd, child_inode->meta*sb->blksz, SEEK_SET);
+                read(sb->fd, child_node_info, sb->blksz);
+
+                if(strcmp(child_node_info->name, subfolders[subfolder_index]) == 0){
+                    found = 1;
+                    break;
+                }
+            }
+
+            if(found){
+                // A subpasta ou arquivo foi encontrada no iNode atual
+                if(subfolder_index == (path_elements_count-1)){
+                    block_numbers[0] = child_inode->meta;
+                    block_numbers[1] = current_inode->links[inode_index];
+                }else{
+                    parent_info_block_number = child_inode->meta;
+                    parent_inode_block_number = current_inode->links[inode_index];
+                }
+                break;
+            }else if(subfolder_index == (path_elements_count-1) || current_inode->next == 0){
+                // O diretório não foi encontrado
+                errno = ENOENT;
+                return -1;
+            }
+
+            // Saltar para o próximo iNode
+            lseek(sb->fd, current_inode->next*sb->blksz, SEEK_SET);
+            read(sb->fd, current_inode, sb->blksz);
+        }
+
+        // Salvar informações sobre o diretório anterior
+        copy_inode(parent_inode, current_inode, current_node_info);
+        copy_nodeinfo(parent_node_info, current_node_info);
+
+        // Saltar para o próximo diretório
+        copy_inode(current_inode, child_inode, child_node_info);
+        copy_nodeinfo(current_node_info, child_node_info);
+    }
+
+    // Verificar se o diretório está vazio
+    if(current_node_info->size > 0){
+        errno = ENOTEMPTY;
+        return -1;
+    }
+
+    // Liberar blocos do nodeinfo e iNode do diretório
+    fs_put_block(sb, block_numbers[0]);
+    fs_put_block(sb, block_numbers[1]);
+
+    // Remover o diretório excluído dos links do diretório pai
+    for(index = 0; index < parent_node_info->size; index++){
+        if(parent_inode->links[index] == block_numbers[1]){
+            while(index < parent_node_info->size-1){
+                parent_inode->links[index] = parent_inode->links[index+1];
+                index++;
+            }
+            break;
+        }
+    }
+
+    // Atualizar as informações do diretório pai
+    lseek(sb->fd, parent_inode_block_number*sb->blksz, SEEK_SET);
+    write(sb->fd, parent_inode, sb->blksz);
+
+    parent_node_info->size--;
+    lseek(sb->fd, parent_info_block_number*sb->blksz, SEEK_SET);
+    write(sb->fd, parent_node_info, sb->blksz);
+
+    // Escrever o superblock atualizado
+    lseek(sb->fd, 0, SEEK_SET);
+    write(sb->fd, sb, sb->blksz);
+
+    free(current_inode);
+    free(child_inode);
+    free(parent_inode);
+    free(current_node_info);
+    free(child_node_info);
+    free(parent_node_info);
+
+    return 0;
 }
 
-char * fs_list_dir(struct superblock *sb, const char *dname){
+char* fs_list_dir(struct superblock* sb, const char* directory_name) {
+    int index, subfolder_index, inode_index, position, found;
+    int path_elements_count;
+    char subfolders[MAX_SUBFOLDERS][MAX_NAME];
+    char* token;
+    char* path;
+    char* elements;
     
+    struct inode* current_inode, * child_inode;
+    struct nodeinfo* current_node_info, * child_node_info;
+
+    current_inode = (struct inode*) malloc(sb->blksz);
+    child_inode = (struct inode*) malloc(sb->blksz);
+    current_node_info = (struct nodeinfo*) malloc(sb->blksz);
+    child_node_info = (struct nodeinfo*) malloc(sb->blksz);
+
+    path = (char*) malloc(MAX_PATH_NAME * sizeof(char));
+    strcpy(path, directory_name);
+
+    // Separar as subpastas em um vetor de strings
+    index = 0;
+    token = strtok(path, "/"); // Diretório raiz
+    while (token != NULL) {
+        strcpy(subfolders[index], token);
+        token = strtok(NULL, "/");
+        index++;
+    }
+    path_elements_count = index;
+
+    // iNode do diretório raiz
+    lseek(sb->fd, sb->root * sb->blksz, SEEK_SET);
+    read(sb->fd, current_inode, sb->blksz);
+
+    // Nodeinfo do diretório raiz
+    lseek(sb->fd, sb->blksz, SEEK_SET);
+    read(sb->fd, current_node_info, sb->blksz);
+
+    // Percorrer cada subpasta no caminho
+    for (subfolder_index = 0; subfolder_index < path_elements_count; subfolder_index++) {
+        // Verificar cada elemento dentro do diretório atual
+        while (1) {
+            found = 0;
+            // Verificar se o elemento está no iNode atual
+            for (inode_index = 0; inode_index < current_node_info->size; inode_index++) {
+                // iNode de um arquivo
+                lseek(sb->fd, current_inode->links[inode_index] * sb->blksz, SEEK_SET);
+                read(sb->fd, child_inode, sb->blksz);
+            
+                // Verificar se estamos em um iNode filho
+                if (child_inode->mode == IMCHILD) {
+                    // Saltar para o primeiro iNode
+                    lseek(sb->fd, child_inode->parent * sb->blksz, SEEK_SET);
+                    read(sb->fd, child_inode, sb->blksz);
+                }
+                
+                // Obter as informações do nodeinfo do arquivo
+                lseek(sb->fd, child_inode->meta * sb->blksz, SEEK_SET);
+                read(sb->fd, child_node_info, sb->blksz);
+
+                if (strcmp(child_node_info->name, subfolders[subfolder_index]) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+
+            if (found) {
+                // A subpasta ou arquivo foi encontrada no iNode atual
+                break;
+            } else if (subfolder_index == (path_elements_count - 1) || current_inode->next == 0) {
+                // O diretório não foi encontrado
+                errno = ENOENT;
+                elements = (char*) malloc(3 * sizeof(char));
+                strcpy(elements, "-1");
+                return elements;
+            }
+
+            // Saltar para o próximo iNode
+            lseek(sb->fd, current_inode->next * sb->blksz, SEEK_SET);
+            read(sb->fd, current_inode, sb->blksz);
+        }
+
+        // Saltar para o próximo diretório
+        copy_inode(current_inode, child_inode, child_node_info);
+        copy_nodeinfo(current_node_info, child_node_info);
+    }
+
+    elements = (char*) malloc(MAX_PATH_NAME * sizeof(char));
+    position = 0;
+    elements[0] = '\0';
+
+    for (index = 0; index < current_node_info->size; index++) {
+        // iNode de um arquivo
+        lseek(sb->fd, current_inode->links[index] * sb->blksz, SEEK_SET);
+        read(sb->fd, child_inode, sb->blksz);
+    
+        // Verificar se estamos em um iNode filho
+        if (child_inode->mode == IMCHILD) {
+            // Saltar para o primeiro iNode
+            lseek(sb->fd, child_inode->parent * sb->blksz, SEEK_SET);
+            read(sb->fd, child_inode, sb->blksz);
+        }
+        
+        // Obter as informações do nodeinfo do arquivo
+        lseek(sb->fd, child_inode->meta * sb->blksz, SEEK_SET);
+        read(sb->fd, child_node_info, sb->blksz);
+
+        strcpy((elements + position), child_node_info->name);
+        position += strlen(child_node_info->name);
+
+        if (child_inode->mode == IMDIR) {
+            // É um diretório
+            elements[position] = '/';
+            elements[position + 1] = '\0';
+            position++;
+        }
+
+        if (index < current_node_info->size - 1) {
+            elements[position] = ' ';
+            elements[position + 1] = '\0';
+            position++;
+        }
+    }
+
+    free(current_inode);
+    free(child_inode);
+    free(current_node_info);
+    free(child_node_info);
+
+    return elements;
 }
